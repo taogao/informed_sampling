@@ -1,0 +1,406 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Dec 29 14:15:21 2015
+
+@author: Edward Coen
+"""
+
+"""
+k_means.py
+Created by Tao Gao on Dec 12, 2015
+implementating the functions associated with k_means classification
+(1) training:
+    taking a large amount of synthesized image and do unsupervised classification
+(2) classification:
+    taking a new image, output its classification and associated class paramaters
+"""
+import os
+import cv2
+import numpy as np
+import random
+from scipy import stats 
+from scipy import cluster 
+import matplotlib.pylab as plt
+
+#parameters of k-means
+K = 4
+Times_iter = 10
+Thresh = 1e-10
+ 
+#parameters of kde
+Num_imageparameters = 24
+
+#parameters of features with minAreaRect alogrithm
+Num_featuresminAreaRect = 4 # Num_features of minAreaRect
+Num_objectsminAreaRect = 6# Num of objects to cluster using minAreaRect alogrithm; 6 tiles
+
+#parameters of features with color histogram alogrithm
+Num_heightdivide = 4
+Num_widthdivide = 4
+Num_colorlevels = 4
+Num_featurescolorhistogram = 3*Num_colorlevels*Num_widthdivide*Num_heightdivide
+
+#parameters of features with hog alogrithm
+Num_step = 4
+Num_cell = 8
+
+Nbins = 8
+DerivAperture = 1
+WinSigma = 4.
+HistogramNormType = 0
+L2HysThreshold = 2.0000000000000001e-01
+GammaCorrection = 0
+Nlevels = 64
+Num_featureshog = np.power(Num_cell,2)*Nbins
+
+#parameters of features with hog&color histogram alogrithm
+Num_objectshog = 1 # 1 image
+Num_objectscolorhistogram = 1 # 1 image
+Num_objectshogandcolorhistogram = 1 # 1 image
+
+#parameters of Andcews
+Andcews_blocklow = -10
+Andcews_blockhigh = 10
+Num_samplesandcews = 3
+Num_intervals = 500
+
+#properties of images
+class training_images:
+    dir = os.getcwd() #get the current working directory
+    format = '.png'
+    prefix = 'training_image'
+    num = 100
+    format_parameterfile = '.txt'
+
+class test_images:
+    dir = os.getcwd() #get the current working directory
+    format = '.png'
+    prefix = 'test'
+    num = 1
+    
+class expectation_images:
+    dir = os.getcwd() #get the current working directory
+    format = '.png'
+    prefix = 'expectation'
+    num = 1
+
+#trans image to pixel data (height * width BRG matrix)
+def image2pixel(image, num_image):     
+    name_image = os.path.join(image.dir, '_'.join([image.prefix, str(num_image), image.format]))
+    data_image = cv2.imread(name_image)  
+    return data_image
+
+#trans pixel data to single channael image of BGR
+def pixel2BGR_singlechannel(data_image):
+    b_single = cv2.split(data_image)[0]  
+    g_single = cv2.split(data_image)[1]  
+    r_single = cv2.split(data_image)[2]
+    return b_single, g_single, r_single
+
+#select the area of each color
+def colorselecter_with_singlechannel (b_single, g_single, r_single):
+    blue_tile = cv2.bitwise_and(b_single, cv2.bitwise_not(cv2.bitwise_or(g_single, r_single))) 
+    green_tile = cv2.bitwise_and(g_single, cv2.bitwise_not(cv2.bitwise_or(b_single, r_single)))
+    red_tile = cv2.bitwise_and(r_single, cv2.bitwise_not(cv2.bitwise_or(b_single, g_single)))
+    cyan_tile = cv2.bitwise_and(b_single, g_single)
+    purple_tile = cv2.bitwise_and(b_single, r_single)
+    yellow_tile = cv2.bitwise_and(g_single, r_single)
+    
+    return blue_tile, green_tile, red_tile, yellow_tile, purple_tile, cyan_tile 
+
+
+#find the contour of the area    
+def features_for_eachtile (color_tile):
+    ret, binary = cv2.threshold(color_tile, 127, 255, 0) #trans color image to binary image/gray image
+    contours, hierarchy = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if contours :            
+        #output ((x,y), (width, height), angle); x,y is the position of the left top point of minAreaRect
+        features = cv2.minAreaRect(contours[0])
+        #output (x,y, max(width, height), angle)
+        features_corrected = (features[0][0], features[0][1], max(features[1]), -1.*features[2])  #features corrected as paper author
+    else:
+        features_corrected = (0, 0, 0, 0)
+        
+    return features_corrected
+
+#get features using OpenCV minAreaRect algorithm    
+def minAreaRect_feature(image):
+    features = np.zeros((Num_objectsminAreaRect, image.num, Num_featuresminAreaRect))
+    
+    for i in xrange(image.num):
+        data_image = image2pixel(image, i)
+        b_single, g_single, r_single = pixel2BGR_singlechannel(data_image)    
+        for k in xrange(Num_objectsminAreaRect):
+            color_tile = colorselecter_with_singlechannel (b_single, g_single, r_single)[k] 
+            features[k][i] = features_for_eachtile(color_tile)        
+    return features, 'minAreaRect_feature'
+
+#get the features of color histogram for the divided image 
+def colorhistogram_calculate(data_image):
+    
+    height_block = data_image.shape[0]/Num_heightdivide
+    width_block = data_image.shape[1]/Num_widthdivide
+    
+
+    features = np.zeros((Num_heightdivide*Num_widthdivide, 3*Num_colorlevels))
+    
+    for i in range(Num_heightdivide):
+        for j in range(Num_widthdivide):
+            red = np.zeros(256)
+            green = np.zeros(256)
+            blue = np.zeros(256)
+            for m in range(height_block):
+                for n in range(width_block):
+                    red_level = data_image[(height_block)*i+m, (width_block)*j+n, 2]
+                    red[red_level] = red[red_level]+1
+                    green_level = data_image[(height_block)*i+m, (width_block)*j+n, 1]
+                    green[green_level] = green[green_level]+1
+                    blue_level = data_image[(height_block)*i+m, (width_block)*j+n, 0]
+                    blue[blue_level] = blue[blue_level]+1
+                    
+            red = red.reshape(Num_colorlevels, 256/Num_colorlevels)
+            sum_red = np.sum(red, axis = 1) 
+            green = green.reshape(Num_colorlevels, 256/Num_colorlevels)
+            sum_green = np.sum(green, axis = 1) 
+            blue = blue.reshape(Num_colorlevels, 256/Num_colorlevels)
+            sum_blue = np.sum(red, axis = 1)
+            features[i*Num_heightdivide+j] = np.concatenate((sum_red, sum_green, sum_blue))
+            
+    features = features.reshape(Num_featurescolorhistogram, )    
+    return features  
+
+def hog_calculate(data_image):   
+    winSize = (data_image.shape[0], data_image.shape[1])
+    blockSize = (data_image.shape[0]/Num_step, data_image.shape[1]/Num_step)
+    blockStride = (data_image.shape[0]/Num_step, data_image.shape[1]/Num_step)
+    cellSize = (data_image.shape[0]/Num_cell, data_image.shape[1]/Num_cell)
+
+    hog = cv2.HOGDescriptor(winSize, blockSize, blockStride, cellSize, Nbins, DerivAperture, WinSigma,
+                            HistogramNormType, L2HysThreshold, GammaCorrection, Nlevels)
+    features = hog.compute(data_image).reshape(512)
+    return features
+
+def colorhistogram_feature(image):
+    features = np.zeros((Num_objectscolorhistogram, image.num, Num_featurescolorhistogram))    
+    
+    for i in xrange(image.num):
+        data_image = image2pixel(image, i)   
+        for k in xrange(Num_objectscolorhistogram):
+            features[k][i] = colorhistogram_calculate(data_image)      
+    return features, 'colorhistogaram_feature' 
+    
+def hog_feature(image):
+    features = np.zeros((Num_objectshog, image.num, Num_featureshog))    
+    
+    for i in xrange(image.num):
+        data_image = image2pixel(image, i)   
+        for k in xrange(Num_objectshog):
+            features[k][i] = hog_calculate(data_image)      
+    return features, 'hog_feature'
+    
+def hogandcolorhistogram_feature(image):
+    
+    features = np.zeros((Num_objectshogandcolorhistogram, image.num, Num_featureshog+Num_featurescolorhistogram))    
+    
+    for i in xrange(image.num):
+        data_image = image2pixel(image, i)   
+        for k in xrange(Num_objectshogandcolorhistogram):
+            features[k][i] = np.concatenate((hog_calculate(data_image), colorhistogram_calculate(data_image)))       
+    return features, 'hogandcolorhistogram_feature'         
+            
+def kde(parameters_class):
+    kde = stats.gaussian_kde(parameters_class.T)
+    resample_kde = kde.resample(size=1000)
+
+    avg = np.average(resample_kde,axis=1)
+    cov = np.cov(resample_kde)
+    return kde, avg, cov
+    
+#calculate the Euclidean distance     
+def Eudistance_cal(vector1, vector2):  
+    return sqrt(sum(pow(vector2 - vector1, 2)))   
+
+def initialization_visualization():
+    #plt            
+    figure, ax = plt.subplots()
+    line2d, = ax.plot(np.nan, np.nan)
+    return figure, ax, line2d
+    
+def visualization_kmeans_distances(x_data, y_data, color, ax, line2d):
+
+    line2d.set_xdata(x_data)
+    line2d.set_ydata(y_data)
+    line2d.set_color(color)
+    ax = line2d.get_axes()
+    ax.relim()
+    ax.autoscale_view()
+    ax.get_figure().canvas.draw()
+    plt.pause(0.0001) 
+    
+def andcews_function(features_samplesclass, interval_point):    
+    num_features = features_samplesclass.shape[1]
+    alpha = features_samplesclass[:, 0]/np.sqrt(2)
+    for i in range(1, num_features):
+        alpha = alpha + features_samplesclass[:, i]*np.sin((0.5*np.pi)*np.mod(i, 2)-np.floor(i/2)*interval_point)
+    return alpha
+    
+def andcews_data(features_samplesclass, class_clusters):
+    num_samples = features_samplesclass.shape[0]
+    
+    andcews = np.zeros((num_samples, Num_intervals))
+    length_interval = (Andcews_blocklow-Andcews_blockhigh)/Num_intervals
+    intervals = np.linspace(Andcews_blocklow, Andcews_blockhigh, Num_intervals) 
+    i = 0      
+    for interval_point in intervals:
+        andcews[:, i] = andcews_function(features_samplesclass, interval_point)
+        i = i + 1
+    return intervals, andcews
+#    
+def visualization_andcews(x_data, y_data, color, ax, line2d):
+
+    line2d.set_xdata(x_data)
+    line2d.set_ydata(y_data)
+    line2d.set_color(color)
+    ax = line2d.get_axes()
+    ax.relim()
+    ax.autoscale_view()
+    ax.get_figure().canvas.draw()
+    plt.pause(0.001) 
+    plt.show()
+    
+def k_means_training(images, method_features, k):    
+    features, name_method = method_features(images)
+    num_clusterobjects = features.shape[0]
+    num_samples = features.shape[1]
+    num_features = features.shape[2]
+    
+    mean_features = np.mean(features, axis = 1)
+    std_features = np.std(features, axis = 1)
+    normalized_features = np.zeros_like(features)
+    centroids_temp = np.zeros((num_clusterobjects, k, num_features))
+    labels_temp = np.zeros((num_clusterobjects, images.num))
+    distances_temp = np.zeros((num_clusterobjects, k, images.num)) 
+
+    
+    name_parameterfile = os.path.join(images.dir, (images.prefix+images.format_parameterfile))
+    parameters_images = np.loadtxt(name_parameterfile)[0:images.num, :]
+    parameters_eachobject = np.zeros((num_clusterobjects, images.num, Num_imageparameters/num_clusterobjects))
+    kde_ori = dict()
+    kde_avg = dict()
+    kde_cov = dict()
+    
+    """k-means and visualized the distance change"""
+    for i in xrange(num_clusterobjects):
+        # normalized the features
+        normalized_features[i] = (features[i]-mean_features[i])/std_features[i]
+        distances = np.inf
+        #plt            
+        figure_kmeans, ax_kmeans, line2d_kmeans = initialization_visualization()
+        for j in xrange(Times_iter): #select best result from n times kmeans 
+            #apply kmeans
+            # step 1: init centers with random samples  
+            index_centers = random.sample(range(0, num_samples), k)
+            centroids_temp[i] = normalized_features[i][np.array(index_centers)]
+            distances_changed = Thresh + 1
+            distances_tempavg = []
+            while distances_changed > Thresh:  
+                differences = normalized_features[i, np.newaxis, :]-centroids_temp[i, :, np.newaxis]
+                distances_temp[i] = np.sqrt(np.sum(differences * differences, axis = -1))
+#                print distances_temp[i]
+                # step 2: find the centers which makes the distances of all the samples minimum 
+                labels_temp[i] = np.argmin(distances_temp[i], axis = 0)
+
+#                print labels_temp[i]
+                min_dist = np.minimum.reduce(distances_temp[i], axis = 0) 
+                distances_tempavg.append(np.mean(min_dist, axis = -1))
+                # step 3: update centers  
+                for l in xrange(k):  
+                    points_clusters = normalized_features[i][np.nonzero(labels_temp[i] == l)] 
+                    centroids_temp[i, l, :] = np.mean(points_clusters, axis = 0)  
+                    
+                if len(distances_tempavg) > 1:
+                    distances_changed = distances_tempavg[-2] - distances_tempavg[-1]
+                plt.ion()
+                times = xrange(len(distances_tempavg))
+                color_line = (0, 0 ,0)
+                visualization_kmeans_distances(times, distances_tempavg, color_line, ax_kmeans, line2d_kmeans)
+                
+            if distances_tempavg[-1] < distances:
+                labels = labels_temp
+                centroids = centroids_temp
+                distances = distances_tempavg[-1]
+                figure_kmeans.savefig((os.path.join(os.getcwd(), (name_method+'_obj_'+str(i)+'_distances_kmeans.png'))))
+                plt.close()
+#                
+        np.savetxt((os.path.join(os.getcwd(), (name_method+'_obj_'+str(i)+'_cluster_result.txt'))), labels[i].T, ['%d'])  
+        
+        """kde"""
+        """andcews"""
+        #parameters of each class
+        parameters_eachobject[i] = parameters_images[:, i*Num_imageparameters/num_clusterobjects:(i+1)*Num_imageparameters/num_clusterobjects] 
+        figure_andcews, ax_andcews, line2d_andcews = initialization_visualization()        
+        #show andcews result          
+        for m in xrange(k):
+            parameters = parameters_eachobject[i][np.nonzero(labels[i] == m)]
+#            print (parameters_clusters[i])
+            kde_ori[(i, m)], kde_avg[(i, m)], kde_cov[(i, m)] = kde(parameters)
+            
+            features_samplesclass = normalized_features[i][np.nonzero(labels_temp[i] == m)]
+            intervals, andcews = andcews_data(features_samplesclass, m)
+            color_change = np.zeros(3)
+            color_change[np.mod(m,3)] = float(np.divide(m,3)+1)/(np.divide(k,3)+1)
+            color_line = (color_change[0], color_change[1], color_change[2])
+            for n in range(Num_samplesandcews):
+                ax_andcews.plot(intervals, andcews[n,:], color = color_line)
+        figure_andcews.savefig((os.path.join(os.getcwd(), (name_method+'_obj_'+str(i)+'_andcews_curves.png'))))
+        plt.close()            
+    return centroids, mean_features, std_features, kde_ori, kde_avg, kde_cov                  
+
+    
+
+def k_classifier(image, method_features, k = K):
+    features, name_method = method_features(image)
+    num_clusterobjects = features.shape[0]
+    num_features = features.shape[2]
+    
+    normalized_features = np.zeros_like(features)
+    centroids, mean_features, std_features, kde_ori, kde_avg, kde_cov = k_means_training(training_images, method_features, k)
+    kde_image = dict()
+    kdeavg_image = dict()
+    kdecov_image = dict()
+    
+    for i in xrange(num_clusterobjects):
+        min_distance  = np.inf
+        index_clusters = 0   
+        # normalized the features
+        normalized_features[i] = (features[i]-mean_features[i])/std_features[i]
+        for j in xrange(k):
+            distance = Eudistance_cal(centroids[i][j],  normalized_features[i])  
+            if distance < min_distance:  
+                min_distance  = distance  
+                index_clusters = j  
+        
+        kde_image[i],  kdeavg_image[i], kdecov_image[i] = kde_ori[(i, index_clusters)], kde_avg[(i, index_clusters)], kde_cov[(i, index_clusters)]      
+    
+    return kde_image, kdeavg_image, kdecov_image 
+    
+    
+def k_means_classification(k_classifier, image, method_features):
+    """
+    input:
+        image: np.array (m*n*3)
+    output:
+        distribution: paramatic as kernal density?? (a function))
+    """      
+    return k_classifier(image, method_features)
+    #TODO: figure out what is the right representation of the "distribution" ?
+
+def main():
+    pass
+
+if __name__ == '__main__':
+    main()
+    k_means_classification(k_classifier, test_images, hog_feature)
+
+    
